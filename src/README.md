@@ -4,7 +4,7 @@ home: true
 icon: home
 heroText: LX Music Api Server
 tagline: 适用于 LX Music 的解析接口服务器的 Python 实现
-heroImage: https://img2.imgtp.com/2024/04/08/AaDnm8dY.png
+heroImage: /images/favicon.ico
 actions:
   - text: 如何部署？
     link: /guide/readme.md
