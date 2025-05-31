@@ -127,6 +127,11 @@ async def Handle(
 ) -> JSONResponse:
     enable, inlist = GetKeyInfo(request.headers.get("X-Request-Key", ""))
 
+    if enable and not inlist:
+        return JSONResponse(
+            {"code": code.NOT_ACCEPT, "message": "Key错误"}
+        )
+
     method = request.url.path.split("/")[1]
 
     if not method:
