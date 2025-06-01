@@ -3,6 +3,8 @@ import shutil
 import sys
 import zlib
 
+import aiohttp
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import re
@@ -12,16 +14,10 @@ import ujson
 import modules
 import binascii
 import traceback
-import uvicorn
-from fastapi import FastAPI
-from fastapi import Request
-from fastapi import Response
-from fastapi.responses import (
-    JSONResponse,
-    StreamingResponse,
-    FileResponse,
-    HTMLResponse,
-)
+import aiohttp.web
+from aiohttp.web import Application
+from aiohttp.web import Request
+from aiohttp.web import json_response, Response, StreamResponse, FileResponse
 from common import (
     code,
     utils,
@@ -33,82 +29,87 @@ from common.log import log
 from common.utils import IsLocalIP, createMD5
 from common.request import GetIPInfo
 from common.config import ReadConfig, CheckIPBanned, GetKeyInfo
-from typing import List
 
 with open("./statistics.json", "r") as f:
     content = f.read()
     status = ujson.loads(content)
 
-app = FastAPI(
-    version=variable.PackageInfo["version"],
-    license_info={
-        "name": "MIT",
-        "identifier": "MIT",
-    },
-)
-utils.setGlobal(app, "app")
-
-logger = log("Main+FastAPI")
+logger = log("Main+WebServer")
 stopEvent = asyncio.exceptions.CancelledError
 
 
-@app.middleware("http")
-async def before(request: Request, call_next) -> dict | Response | JSONResponse | None:
-    variable.StatsManager.increment("all_request")
+def handleResponse(request: Request, body: dict, status: int = 200) -> Response:
+    if "yourinfo" not in body:
+        body["yourinfo"] = {
+            "ip": request.remote_addr,
+            "ua": request.headers.get("User-Agent", ""),
+        }
+    return json_response(body, status=status)
 
-    try:
-        if ReadConfig("common.reverse_proxy.allow_proxy") and request.headers.get(
-            ReadConfig("common.reverse_proxy.real_ip_header")
-        ):
-            if not (
-                ReadConfig("common.reverse_proxy.allow_public_ip")
-                or IsLocalIP(request.remote)
+
+async def before(app, handler):
+    async def _before(request: Request) -> dict | Response | None:
+        variable.StatsManager.increment("all_request")
+
+        try:
+            if ReadConfig("common.reverse_proxy.allow_proxy") and request.headers.get(
+                ReadConfig("common.reverse_proxy.real_ip_header")
             ):
-                return JSONResponse(
-                    {"code": code.NOT_ACCEPT, "message": "不允许的公网IP转发"},
+                if not (
+                    ReadConfig("common.reverse_proxy.allow_public_ip")
+                    or IsLocalIP(request.remote)
+                ):
+                    return handleResponse(
+                        request,
+                        {"code": code.NOT_ACCEPT, "message": "不允许的公网IP转发"},
+                        code.NOT_ACCEPT,
+                    )
+
+                request.remote_addr = str(
+                    request.headers[ReadConfig("common.reverse_proxy.real_ip_header")]
+                )
+            else:
+                request.remote_addr = request.remote
+
+            if CheckIPBanned(request.remote_addr):
+                return handleResponse(
+                    request,
+                    {"code": code.NOT_ACCEPT, "message": "IP is banned."},
                     code.NOT_ACCEPT,
                 )
 
-            remote_addr = str(
-                request.headers[ReadConfig("common.reverse_proxy.real_ip_header")]
-            )
-        else:
-            remote_addr = request.client.host
+            IPInfo = await GetIPInfo(request.remote_addr)
 
-        if CheckIPBanned(remote_addr):
-            return JSONResponse(
-                {"code": code.NOT_ACCEPT, "message": "IP is banned."}, code.NOT_ACCEPT
+            logger.info(
+                f"Req: {request.method} - {request.remote_addr} - {IPInfo['local']} - {request.url.path} - {request.headers['User-Agent']} - {request.url.query_string} - {request.headers.get('X-Request-Key', '')}"
             )
 
-        IPInfo = await GetIPInfo(remote_addr)
+            start_time = time.perf_counter()
+            response = await handler(request)
+            process_time = time.perf_counter() - start_time
 
-        logger.info(
-            f"Req: {request.method} - {remote_addr} - {IPInfo['local']} - {request.url.path} - {request.headers['User-Agent']} - {request.url.query} - {request.headers.get('X-Request-Key', '')}"
-        )
+            if isinstance(
+                response,
+                (Response, StreamResponse, FileResponse),
+            ):
+                response = response
 
-        start_time = time.perf_counter()
-        response = await call_next(request)
-        process_time = time.perf_counter() - start_time
+            response.headers["X-Process-Time"] = str(process_time)
 
-        if isinstance(
-            response,
-            (Response, JSONResponse, StreamingResponse, FileResponse, HTMLResponse),
-        ):
-            response = response
+            return response
+        except BaseException:
+            logger.error(traceback.format_exc())
+            return handleResponse(
+                request,
+                {"code": code.SERVER_ERROR, "message": "服务器内部错误"},
+                code.SERVER_ERROR,
+            )
+        except KeyboardInterrupt:
+            return
 
-        response.headers["X-Process-Time"] = str(process_time)
-
-        return response
-    except BaseException:
-        logger.error(traceback.format_exc())
-        return JSONResponse(
-            {"code": code.SERVER_ERROR, "message": "服务器内部错误"}, code.SERVER_ERROR
-        )
-    except KeyboardInterrupt:
-        return
+    return _before
 
 
-@app.get("/", tags=["/"])
 async def Home(request: Request):
     return {
         "code": code.SUCCESS,
@@ -116,31 +117,24 @@ async def Home(request: Request):
     }
 
 
-@app.get("/url", tags=["url"])
-@app.get("/lyric", tags=["lyric"])
-@app.get("/info", tags=["info"])
 async def Handle(
     request: Request,
-    source: str,
-    songId: str | int,
-    quality: str | None = None,
-) -> JSONResponse:
+) -> Response:
     enable, inlist = GetKeyInfo(request.headers.get("X-Request-Key", ""))
 
     if enable and not inlist:
-        return JSONResponse(
-            {"code": code.NOT_ACCEPT, "message": "Key错误"}
+        return handleResponse(
+            request, {"code": code.NOT_ACCEPT, "message": "Key错误"}, code.NOT_ACCEPT
         )
 
     method = request.url.path.split("/")[1]
-
-    if not method:
-        return JSONResponse(
-            {"code": code.INVALID_REQUEST, "message": "参数缺失"}, code.INVALID_REQUEST
-        )
+    source = request.query.get("source")
+    songId = request.query.get("songId")
+    quality = request.query.get("quality")
 
     if method == "url" and quality is None:
-        return JSONResponse(
+        return handleResponse(
+            request,
             {"code": code.INVALID_REQUEST, "message": "必须参数: quality"},
             code.INVALID_REQUEST,
         )
@@ -149,41 +143,49 @@ async def Handle(
         if source == "kg":
             songId = songId.lower()
         result = await getattr(modules, method)(source, songId, quality)
-        return JSONResponse(result)
+        return handleResponse(request, result)
     except BaseException:
         logger.error(traceback.format_exc())
-        return JSONResponse(
-            {"code": code.SERVER_ERROR, "message": "内部服务器错误"}, code.SERVER_ERROR
+        return handleResponse(
+            request,
+            {"code": code.SERVER_ERROR, "message": "内部服务器错误"},
+            code.SERVER_ERROR,
         )
 
 
-@app.get("/search", tags=["search"])
-async def HandleSearch(
-    source: str,
-    keyword: str,
-    pages: int,
-    limit: int,
-):
+async def HandleSearch(request: Request):
+    source = request.query.get("source")
+    keyword = request.query.get("keyword")
+    pages = request.query.get("pages")
+    limit = request.query.get("limit")
+
+    if not source or keyword or pages or limit:
+        return handleResponse(
+            request, {"code": code.INVALID_REQUEST, "message": "缺少参数"}
+        )
+
     try:
         result = await modules.search(source, keyword, pages, limit)
-        return JSONResponse(result)
+        return handleResponse(request, result)
     except BaseException:
         logger.error(traceback.format_exc())
-        return JSONResponse(
-            {"code": code.SERVER_ERROR, "message": "内部服务器错误"}, code.SERVER_ERROR
+        return handleResponse(
+            request,
+            {"code": code.SERVER_ERROR, "message": "内部服务器错误"},
+            code.SERVER_ERROR,
         )
 
 
-@app.get("/script", tags=["script"])
 async def Script(
     request: Request,
-    key: str | None = None,
 ):
+    key = request.query.get("key")
+
     enable, inlist = GetKeyInfo(key)
 
     if (not inlist) and (enable):
-        return JSONResponse(
-            {"code": code.NOT_ACCEPT, "message": "Key错误"}, code.NOT_ACCEPT
+        return handleResponse(
+            request, {"code": code.NOT_ACCEPT, "message": "Key错误"}, code.NOT_ACCEPT
         )
 
     try:
@@ -192,8 +194,8 @@ async def Script(
         ) as f:
             script = f.read()
     except:
-        return JSONResponse(
-            {"code": code.NOT_FOUND, "message": "本地无源脚本"}, code.NOT_FOUND
+        return handleResponse(
+            request, {"code": code.NOT_FOUND, "message": "本地无源脚本"}, code.NOT_FOUND
         )
 
     scriptLines = script.split("\n")
@@ -207,7 +209,7 @@ async def Script(
         )
         url = (
             f"{request.url.scheme}"
-            + f"://{host if host else request.url.hostname}"
+            + f"://{host if host else request.url.host}"
             + f":{request.url.port}"
             if request.url.port
             else None
@@ -256,12 +258,14 @@ async def Script(
     if ReadConfig("common.download_config.update"):
         md5 = createMD5(r)
         r = r.replace(r'const SCRIPT_MD5 = "";', f'const SCRIPT_MD5 = "{md5}";')
-        if request.query_params.get("checkUpdate"):
-            if request.query_params.get("checkUpdate") == md5:
-                return JSONResponse({"code": code.SUCCESS, "message": "成功"})
+        if request.query.get("checkUpdate"):
+            if request.query.get("checkUpdate") == md5:
+                return handleResponse(
+                    request, {"code": code.SUCCESS, "message": "成功"}
+                )
             url = (
                 f"{request.url.scheme}"
-                + f"://{host if host else request.url.hostname}"
+                + f"://{host if host else request.url.host}"
                 + f":{request.url.port}"
                 if request.url.port
                 else None
@@ -284,8 +288,8 @@ async def Script(
             }
 
     return Response(
-        r,
-        media_type="text/javascript",
+        body=r,
+        content_type="text/javascript",
         headers={
             "Content-Disposition": f"""attachment; filename={
                             ReadConfig("common.download_config.filename")
@@ -295,8 +299,7 @@ async def Script(
     )
 
 
-@app.api_route("/client/cgi-bin/{method}", methods=["GET", "POST"])
-async def gcsp(request: Request, method: str):
+async def gcsp(request: Request):
     PACKAGE = ReadConfig("gcsp.package_md5")
     SALT_1 = ReadConfig("gcsp.salt_1")
     SALT_2 = ReadConfig("gcsp.salt_2")
@@ -409,12 +412,14 @@ async def gcsp(request: Request, method: str):
 
         return Response(compressed_data, media_type="application/octet-stream")
 
+    method = request.match_info.get("method")
+
     if request.method == "POST":
         if method == "api.fcg":
             content_size = request.__len__()
             if content_size > 5 * 1024:
                 return Response(body="Request Entity Too Large", status=413)
-            body = await request.body()
+            body = await request.json()
             return await handleGcspBody(body)
         elif method == "check_version":
             body = {
@@ -464,84 +469,16 @@ async def gcsp(request: Request, method: str):
         return Response(body="Method Not Allowed", status=405)
 
 
-@app.get("/subscription_{key}.json", tags=["subscription"])
-async def GenMFScripts(request: Request, key: str):
-    host = request.headers.get(ReadConfig("common.reverse_proxy.real_host_header"), "")
+app = Application(logger=logger, middlewares=[before])
+utils.setGlobal(app, "app")
 
-    url = (f"{request.url.scheme}" + f"://{host if host else request.url.hostname}") + (
-        f":{request.url.port}" if request.url.port else None
-    )
-
-    enable, inlist = GetKeyInfo(key)
-
-    if (not inlist) and (enable):
-        return JSONResponse({"code": 403, "message": "Key错误"}, 403)
-
-    try:
-        subscription_data = ujson.loads(
-            open("./data/musicfree/plugins.json", "r").read()
-        )
-
-        base_url = url
-        for plugin in subscription_data["plugins"]:
-            script_name = plugin["url"].split("/")[-2]
-            plugin["url"] = f"{base_url}/script/{script_name}?key={key}"
-
-        return JSONResponse(content=subscription_data, status_code=200)
-
-    except Exception as e:
-        return JSONResponse(
-            {"code": 500, "message": f"处理订阅内容时出错: {str(e)}"}, 500
-        )
-
-
-@app.get("/script/{script_name}", tags=["script"])
-async def GetModifiedScript(request: Request, script_name: str, key: str):
-    host = request.headers.get(ReadConfig("common.reverse_proxy.real_host_header"), "")
-
-    url = (f"{request.url.scheme}" + f"://{host if host else request.url.hostname}") + (
-        f":{request.url.port}" if request.url.port else None
-    )
-    enable, inlist = GetKeyInfo(key)
-
-    if (not inlist) and (enable):
-        return JSONResponse({"code": 403, "message": "Key错误"}, 403)
-
-    try:
-        script_content = open(f"./data/musicfree/{script_name}/index.js", "r").read()
-
-        modified_content = re.sub(
-            r'const API_KEY = ".*?";', f'const API_KEY = "{key}";', script_content
-        )
-
-        if 'const API_URL = "";' in modified_content:
-            modified_content = modified_content.replace(
-                'const API_URL = "";', f'const API_URL = "{url}";'
-            )
-
-        if 'const API_KEY = "";' in modified_content:
-            modified_content = modified_content.replace(
-                'const API_KEY = "";', f'const API_KEY = "{key}";'
-            )
-
-        if 'const UPDATE_URL = "";' in modified_content:
-            modified_content = modified_content.replace(
-                'const UPDATE_URL = "";',
-                f'const UPDATE_URL = "{url}/script/{script_name}?key={key}";',
-            )
-
-        return Response(
-            content=modified_content,
-            media_type="application/javascript",
-            headers={
-                "Content-Disposition": f"attachment; filename={script_name}_plugin.js"
-            },
-        )
-
-    except Exception as e:
-        return JSONResponse(
-            {"code": 500, "message": f"处理脚本内容时出错: {str(e)}"}, 500
-        )
+app.router.add_get("/", Home)
+app.router.add_get("/url", Handle)
+app.router.add_get("/info", Handle)
+app.router.add_get("/lyric", Handle)
+app.router.add_get("/search", HandleSearch)
+app.router.add_get("/script", Script)
+app.router.add_route("*", "/client/cgi-bin/{method}", gcsp)
 
 
 from io import TextIOWrapper
@@ -551,86 +488,153 @@ for f in variable.LogFiles:
         f.close()
 
 
-async def clean():
-    if variable.SyncClient:
-        variable.SyncClient.close()
-    if variable.AsyncClient:
-        await variable.AsyncClient.close()
-    if variable.StatsManager:
-        variable.StatsManager.stop()
+async def run_app_host(host):
+    retries = 0
+    while True:
+        if retries > 4:
+            logger.warning(
+                "重试次数已达上限，但仍有部分端口未能完成监听，已自动进行忽略"
+            )
+            break
+        try:
+            ports = [int(port) for port in config.ReadConfig("common.ports")]
+            ssl_ports = [
+                int(port) for port in config.ReadConfig("common.ssl_info.ssl_ports")
+            ]
+            final_ssl_ports = []
+            final_ports = []
+            for p in ports:
+                if p not in ssl_ports and f"{host}_{p}" not in variable.RunningPorts:
+                    final_ports.append(p)
+                else:
+                    if p not in variable.RunningPorts:
+                        final_ssl_ports.append(p)
 
-    logger.info("等待部分进程暂停...")
+            cert_path = config.ReadConfig("common.ssl_info.path.cert")
+            privkey_path = config.ReadConfig("common.ssl_info.path.privkey")
+
+            http_runner = aiohttp.web.AppRunner(app)
+            await http_runner.setup()
+
+            for port in final_ports:
+                if port not in variable.RunningPorts:
+                    http_site = aiohttp.web.TCPSite(http_runner, host, port)
+                    await http_site.start()
+                    variable.RunningPorts.append(f"{host}_{port}")
+                    logger.info(
+                        f"""监听 -> http://{
+                        host if (':' not in host)
+                        else '[' + host + ']'
+                    }:{port}"""
+                    )
+
+            if config.ReadConfig("common.ssl_info.enable") and final_ssl_ports != []:
+                if os.path.exists(cert_path) and os.path.exists(privkey_path):
+                    import ssl
+
+                    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                    ssl_context.load_cert_chain(cert_path, privkey_path)
+
+                    https_runner = aiohttp.web.AppRunner(app)
+                    await https_runner.setup()
+
+                    for port in ssl_ports:
+                        if port not in variable.RunningPorts:
+                            https_site = aiohttp.web.TCPSite(
+                                https_runner, host, port, ssl_context=ssl_context
+                            )
+                            await https_site.start()
+                            variable.RunningPorts.append(f"{host}_{port}")
+                            logger.info(
+                                f"""监听 -> https://{
+                                host if (':' not in host)
+                                else '[' + host + ']'
+                            }:{port}"""
+                            )
+            logger.debug(f"HOST({host}) 已完成监听")
+            break
+        except OSError as e:
+            if str(e).startswith("[Errno 98]") or str(e).startswith("[Errno 10048]"):
+                logger.error("端口已被占用，请检查\n" + str(e))
+                logger.info("服务器将在10s后再次尝试启动...")
+                await asyncio.sleep(10)
+                logger.info("重新尝试启动...")
+                retries += 1
+            else:
+                logger.error("未知错误，请检查\n" + traceback.format_exc())
 
 
-async def Init():
+async def run_app():
+    for host in config.ReadConfig("common.hosts"):
+        await run_app_host(host)
+
+
+async def initMain():
     if not os.path.exists("./data/script/lx-music-source-example.js"):
         shutil.copyfile(
             "./common/lx-music-source-example.js",
             "./data/script/lx-music-source-example.js",
         )
-        logger.info("(1/4)已复制脚本")
 
     await scheduler.run()
-    logger.info("(2/4)已执行定时任务")
-
     variable.StatsManager.start()
-    logger.info("(3/4)已启动计数器")
-
-    servers_config: List[uvicorn.Config] = []
-
-    for bind in config.ReadConfig("common.binds"):
-        ssl_params = {}
-        if bind["scheme"] == "https":
-            ssl_params = {
-                "ssl_certfile": bind["ssl_cert_path"],
-                "ssl_keyfile": bind["ssl_key_path"],
-            }
-
-            if not ssl_params["ssl_certfile"] or not ssl_params["ssl_keyfile"]:
-                raise ValueError(f"HTTPS 配置 {bind['port']} 需要提供 SSL 证书路径")
-
-        servers_config.append(
-            uvicorn.Config(
-                app,
-                host=["0.0.0.0", "::"],
-                port=int(bind["port"]),
-                log_level="critical",
-                access_log=None,
-                **ssl_params,
-            )
-        )
-
-    async def run_server(config: uvicorn.Config):
-        try:
-            logger.info("(4/4)已启动服务器")
-            server = uvicorn.Server(config)
-            await server.serve()
-        except Exception as e:
-            logger.error(f"Port {config.port} 启动失败: {e}")
 
     try:
-        tasks = [run_server(config) for config in servers_config]
-        await asyncio.gather(*tasks)
+        await run_app()
+        logger.info("服务器启动成功，请按下Ctrl + C停止")
         await asyncio.Event().wait()
-    except (stopEvent, KeyboardInterrupt):
-        await clean()
-        variable.Running = False
+    except (KeyboardInterrupt, stopEvent):
+        pass
     except OSError as e:
         logger.error("遇到未知错误，请查看日志")
-        logger.error(e)
+        logger.error(traceback.format_exc())
     except:
         logger.error("遇到未知错误，请查看日志")
         logger.error(traceback.format_exc())
     finally:
-        await clean()
-        if variable.Running:
-            variable.Running = False
-        logger.info("服务器暂停")
-        os._exit(1)
+        logger.info("等待结束...")
+
+        if variable.SyncClient:
+            variable.SyncClient.close()
+        if variable.AsyncClient:
+            await variable.AsyncClient.close()
+        if variable.StatsManager:
+            variable.StatsManager.stop()
+
+        variable.Running = False
+        logger.info("Server stopped")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(Init())
-    except:
+        asyncio.run(initMain())
+    except KeyboardInterrupt:
         pass
+    except:
+        logger.critical("初始化出错，请检查日志")
+        logger.critical(traceback.format_exc())
+        with open(
+            "dumprecord_{}.txt".format(int(time.time())), "w", encoding="utf-8"
+        ) as f:
+            f.write(traceback.format_exc())
+            e = "\n\nGlobal variable object:\n\n"
+            for k in dir(variable):
+                e += (
+                    (k + " = " + str(getattr(variable, k)) + "\n")
+                    if (not k.startswith("_"))
+                    else ""
+                )
+            f.write(e)
+            e = "\n\nsys.modules:\n\n"
+            for k in sys.modules:
+                e += (
+                    (k + " = " + str(sys.modules[k]) + "\n")
+                    if (not k.startswith("_"))
+                    else ""
+                )
+            f.write(e)
+        logger.critical("dumprecord_{}.txt 已保存至当前目录".format(int(time.time())))
+    finally:
+        for f in variable.LogFiles:
+            if f and isinstance(f, TextIOWrapper):
+                f.close()

@@ -1,13 +1,13 @@
 default = {
     "common": {
-        "binds": [
-            {
-                "port": "8000",
-                "scheme": "http",
-                "ssl_cert_path": "",
-                "ssl_key_path": "",
-            },
-        ],
+        "hosts": ["0.0.0.0", "::"],
+        "ports": [9763],
+        "ssl_info": {
+            "is_https": False,
+            "enable": False,
+            "ssl_ports": [443],
+            "path": {"cert": "", "privkey": ""},
+        },
         "reverse_proxy": {
             "allow_public_ip": True,
             "allow_proxy": True,

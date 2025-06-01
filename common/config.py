@@ -40,7 +40,7 @@ def ConnectToRedis() -> redis.Redis:
 
 
 def InitDirs():
-    names = ["./data", "./data/script", "./data/ssl", "./data/gcsp", "./data/musicfree"]
+    names = ["./data", "./data/script", "./data/ssl"]
     for name in names:
         try:
             os.makedirs(name, mode=511, exist_ok=True)

@@ -46,6 +46,7 @@ with open("./package.json", "r", encoding="utf-8") as f:
 
 LogFile: bool = _lm if (isinstance(_lm, bool)) else True
 Running: bool = True
+RunningPorts: list = []
 Config: dict = {}
 WorkDir = os.getcwd()
 FakeIP = None
